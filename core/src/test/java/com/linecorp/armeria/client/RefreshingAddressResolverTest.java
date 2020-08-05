@@ -406,15 +406,45 @@ class RefreshingAddressResolverTest {
                 .traceEnabled(false);
     }
 
+    @Test
+    void cacheClearedWhenDnsTimeout() throws Exception {
+        try (TestDnsServer server = new TestDnsServer(ImmutableMap.of(
+                new DefaultDnsQuestion("foo.com.", A),
+                new DefaultDnsResponse(0).addRecord(ANSWER, newAddressRecord("foo.com.", "1.1.1.1", 1))),
+                                                      new TimeoutHandler(1))
+        ) {
+            final DnsResolverGroupBuilder builder = builder(server).negativeTtl(60).queryTimeoutMillis(1000);
+            try (ClientFactory factory = ClientFactory.builder()
+                                                      .addressResolverGroupFactory(builder::build)
+                                                      .build()) {
+                final WebClient client = WebClient.builder("http://foo.com").factory(factory).build();
+                await().untilAsserted(() -> {
+                    assertThatThrownBy(() -> client.get("/").aggregate().join())
+                            .hasCauseInstanceOf(UnprocessedRequestException.class)
+                            .hasRootCauseExactlyInstanceOf(DnsTimeoutException.class);
+                });
+            }
+        }
+    }
+
     private static class TimeoutHandler extends ChannelInboundHandlerAdapter {
         private int recordACount;
+        private final int timeoutSinceCount;
+
+        TimeoutHandler() {
+            timeoutSinceCount = 0;
+        }
+
+        TimeoutHandler(int timeoutSinceCount) {
+            this.timeoutSinceCount = timeoutSinceCount;
+        }
 
         @Override
         public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
             if (msg instanceof DatagramDnsQuery) {
                 final DatagramDnsQuery dnsQuery = (DatagramDnsQuery) msg;
                 final DnsRecord dnsRecord = dnsQuery.recordAt(DnsSection.QUESTION, 0);
-                if (dnsRecord.type() == A && recordACount++ == 0) {
+                if (dnsRecord.type() == A && recordACount++ >= timeoutSinceCount) {
                     // Just release the msg and return so that the client request is timed out.
                     ReferenceCountUtil.safeRelease(msg);
                     return;
